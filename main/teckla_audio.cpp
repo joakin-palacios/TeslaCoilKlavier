@@ -25,12 +25,17 @@ constexpr i2c_port_t I2C_PORT = I2C_NUM_0;
 constexpr gpio_num_t I2C_SDA = GPIO_NUM_7;
 constexpr gpio_num_t I2C_SCL = GPIO_NUM_8;
 
-constexpr int I2S_PORT = 0;
-constexpr gpio_num_t I2S_MCLK = GPIO_NUM_13;
-constexpr gpio_num_t I2S_BCLK = GPIO_NUM_12;
-constexpr gpio_num_t I2S_WS = GPIO_NUM_10;
-constexpr gpio_num_t I2S_DOUT = GPIO_NUM_9;
-constexpr gpio_num_t I2S_DIN = GPIO_NUM_11;
+constexpr int ES8311_I2S_PORT = 0;
+constexpr gpio_num_t ES8311_I2S_MCLK = GPIO_NUM_13;
+constexpr gpio_num_t ES8311_I2S_BCLK = GPIO_NUM_12;
+constexpr gpio_num_t ES8311_I2S_WS = GPIO_NUM_10;
+constexpr gpio_num_t ES8311_I2S_DOUT = GPIO_NUM_9;
+constexpr gpio_num_t ES8311_I2S_DIN = GPIO_NUM_11;
+
+constexpr int PCM5102_I2S_PORT = 1;
+constexpr gpio_num_t PCM5102_I2S_BCLK = GPIO_NUM_46;
+constexpr gpio_num_t PCM5102_I2S_WS = GPIO_NUM_27;
+constexpr gpio_num_t PCM5102_I2S_DOUT = GPIO_NUM_45;
 constexpr gpio_num_t PA_ENABLE = GPIO_NUM_53;
 
 constexpr uint32_t SAMPLE_RATE = 16000;
@@ -47,8 +52,9 @@ constexpr float MIDI_BASE_GAIN = 16000.0f;
 constexpr float MIDI_MIN_VELOCITY_SCALE = 0.65f;
 constexpr float MIDI_SECOND_HARMONIC_GAIN = 0.35f;
 
-i2s_chan_handle_t tx_handle = nullptr;
-i2s_chan_handle_t rx_handle = nullptr;
+i2s_chan_handle_t es8311_tx_handle = nullptr;
+i2s_chan_handle_t es8311_rx_handle = nullptr;
+i2s_chan_handle_t pcm5102_tx_handle = nullptr;
 es8311_handle_t codec_handle = nullptr;
 StreamBufferHandle_t tts_stream = nullptr;
 TaskHandle_t audio_task_handle = nullptr;
@@ -118,29 +124,52 @@ esp_err_t init_i2c()
     return ESP_OK;
 }
 
-esp_err_t init_i2s()
+esp_err_t init_es8311_i2s()
 {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(ES8311_I2S_PORT, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle), TAG, "create I2S channel failed");
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &es8311_tx_handle, &es8311_rx_handle), TAG, "create ES8311 I2S channel failed");
 
     i2s_std_config_t std_cfg = {};
     std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
     std_cfg.clk_cfg.mclk_multiple = static_cast<i2s_mclk_multiple_t>(MCLK_MULTIPLE);
     std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
-    std_cfg.gpio_cfg.mclk = I2S_MCLK;
-    std_cfg.gpio_cfg.bclk = I2S_BCLK;
-    std_cfg.gpio_cfg.ws = I2S_WS;
-    std_cfg.gpio_cfg.dout = I2S_DOUT;
-    std_cfg.gpio_cfg.din = I2S_DIN;
+    std_cfg.gpio_cfg.mclk = ES8311_I2S_MCLK;
+    std_cfg.gpio_cfg.bclk = ES8311_I2S_BCLK;
+    std_cfg.gpio_cfg.ws = ES8311_I2S_WS;
+    std_cfg.gpio_cfg.dout = ES8311_I2S_DOUT;
+    std_cfg.gpio_cfg.din = ES8311_I2S_DIN;
     std_cfg.gpio_cfg.invert_flags.mclk_inv = false;
     std_cfg.gpio_cfg.invert_flags.bclk_inv = false;
     std_cfg.gpio_cfg.invert_flags.ws_inv = false;
 
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(tx_handle, &std_cfg), TAG, "init I2S TX failed");
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx_handle, &std_cfg), TAG, "init I2S RX failed");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(tx_handle), TAG, "enable I2S TX failed");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(rx_handle), TAG, "enable I2S RX failed");
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(es8311_tx_handle, &std_cfg), TAG, "init ES8311 I2S TX failed");
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(es8311_rx_handle, &std_cfg), TAG, "init ES8311 I2S RX failed");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(es8311_tx_handle), TAG, "enable ES8311 I2S TX failed");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(es8311_rx_handle), TAG, "enable ES8311 I2S RX failed");
+    return ESP_OK;
+}
+
+esp_err_t init_pcm5102_i2s()
+{
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(PCM5102_I2S_PORT, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &pcm5102_tx_handle, nullptr), TAG, "create PCM5102A I2S channel failed");
+
+    i2s_std_config_t std_cfg = {};
+    std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
+    std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+    std_cfg.gpio_cfg.bclk = PCM5102_I2S_BCLK;
+    std_cfg.gpio_cfg.ws = PCM5102_I2S_WS;
+    std_cfg.gpio_cfg.dout = PCM5102_I2S_DOUT;
+    std_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
+    std_cfg.gpio_cfg.invert_flags.mclk_inv = false;
+    std_cfg.gpio_cfg.invert_flags.bclk_inv = false;
+    std_cfg.gpio_cfg.invert_flags.ws_inv = false;
+
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(pcm5102_tx_handle, &std_cfg), TAG, "init PCM5102A I2S TX failed");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(pcm5102_tx_handle), TAG, "enable PCM5102A I2S TX failed");
     return ESP_OK;
 }
 
@@ -297,9 +326,15 @@ void audio_task(void *)
         }
 
         size_t bytes_written = 0;
-        const esp_err_t err = i2s_channel_write(tx_handle, stereo, sizeof(stereo), &bytes_written, portMAX_DELAY);
+        const esp_err_t err = i2s_channel_write(es8311_tx_handle, stereo, sizeof(stereo), &bytes_written, portMAX_DELAY);
         if (err != ESP_OK || bytes_written != sizeof(stereo)) {
-            ESP_LOGW(TAG, "I2S write failed: %s bytes=%u", esp_err_to_name(err), static_cast<unsigned>(bytes_written));
+            ESP_LOGW(TAG, "ES8311 I2S write failed: %s bytes=%u", esp_err_to_name(err), static_cast<unsigned>(bytes_written));
+        }
+
+        bytes_written = 0;
+        const esp_err_t pcm_err = i2s_channel_write(pcm5102_tx_handle, stereo, sizeof(stereo), &bytes_written, portMAX_DELAY);
+        if (pcm_err != ESP_OK || bytes_written != sizeof(stereo)) {
+            ESP_LOGW(TAG, "PCM5102A I2S write failed: %s bytes=%u", esp_err_to_name(pcm_err), static_cast<unsigned>(bytes_written));
         }
     }
 }
@@ -314,7 +349,8 @@ esp_err_t teckla_audio_init()
 
     ESP_RETURN_ON_ERROR(init_power_amp(), TAG, "power amp init failed");
     ESP_RETURN_ON_ERROR(init_i2c(), TAG, "I2C init failed");
-    ESP_RETURN_ON_ERROR(init_i2s(), TAG, "I2S init failed");
+    ESP_RETURN_ON_ERROR(init_es8311_i2s(), TAG, "ES8311 I2S init failed");
+    ESP_RETURN_ON_ERROR(init_pcm5102_i2s(), TAG, "PCM5102A I2S init failed");
     ESP_RETURN_ON_ERROR(init_codec(), TAG, "codec init failed");
 
     tts_stream = xStreamBufferCreate(TTS_STREAM_BYTES, sizeof(int16_t));

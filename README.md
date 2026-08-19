@@ -4,6 +4,7 @@ ESP-IDF firmware for an ESP32-P4 Waveshare-style module dev kit.
 
 - USB host MIDI keyboard input.
 - Onboard ES8311 speaker output.
+- External PCM5102A I2S DAC output with the same mixed audio.
 - PicoTTS spoken assistant output.
 - One central software mixer for MIDI tones, feedback sounds, and TTS samples.
 
@@ -13,7 +14,7 @@ No Tesla coil, motor, or external actuator output is driven by this firmware.
 
 - Plays synthesized MIDI tones from a connected USB MIDI keyboard.
 - Mixes MIDI tones, assistant feedback sounds, and PicoTTS speech through one I2S audio task.
-- Uses the onboard ES8311 codec and speaker path.
+- Uses the onboard ES8311 codec/speaker path and an optional external PCM5102A DAC output.
 - Uses robust USB MIDI input handling with multiple transfers in flight and a parser task.
 - Clears all held MIDI notes on USB disconnect, USB transfer errors, and MIDI all-notes-off style controller messages.
 
@@ -40,13 +41,17 @@ USB MIDI receive is designed to avoid missed note-off bursts during chord playin
 - MIDI packet parsing and note dispatch run in a separate parser task.
 - USB-MIDI Code Index Number values are validated before parsing note/control messages.
 - MIDI Control Change `120`, `121`, and `123` clear all active notes.
-- Normal per-note MIDI logs use debug level (`ESP_LOGD`) to avoid slowing down dense MIDI bursts.
+- MIDI messages are logged at info level from a dedicated logger task, not from USB callbacks.
+- MIDI logging is non-blocking for parsing. If logging cannot keep up, log events are dropped and a warning reports the dropped count.
 
 ## Audio Notes
 
 - Codec output volume is currently set to `70` in `main/teckla_audio.cpp`.
 - MIDI tones use a fundamental plus second harmonic. `MIDI_SECOND_HARMONIC_GAIN` is currently `0.35f`.
-- `audio_task()` is the only I2S writer. TTS, MIDI, and feedback audio must go through the mixer.
+- `audio_task()` is the only audio writer. TTS, MIDI, and feedback audio must go through the mixer.
+- The onboard ES8311 uses I2S port `0`: `MCLK=GPIO13`, `BCLK=GPIO12`, `WS=GPIO10`, `DOUT=GPIO9`, `DIN=GPIO11`.
+- The external PCM5102A output uses I2S port `1`: `BCLK=GPIO46`, `WS/LRCK=GPIO27`, `DOUT=GPIO45`. Connect PCM5102A `DIN` to ESP32 `DOUT`.
+- The PCM5102A output receives the same mixed stereo audio as the onboard speaker path.
 
 ## Build
 

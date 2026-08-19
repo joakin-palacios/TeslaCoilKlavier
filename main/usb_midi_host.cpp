@@ -5,6 +5,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -22,10 +23,37 @@ constexpr uint8_t USB_TRANSFER_TYPE_BULK = 0x02;
 constexpr size_t MIDI_TRANSFER_BYTES = 64;
 constexpr size_t MIDI_TRANSFER_COUNT = 4;
 constexpr size_t MIDI_PACKET_QUEUE_LEN = 32;
+constexpr size_t MIDI_LOG_QUEUE_LEN = 128;
+
+enum class MidiLogMessageType : uint8_t {
+    NoteOff,
+    NoteOn,
+    PolyPressure,
+    ControlChange,
+    ProgramChange,
+    ChannelPressure,
+    PitchBend,
+    SysEx,
+    SystemCommon,
+    SystemRealtime,
+    Unknown,
+};
 
 struct MidiPacketBatch {
     int length;
     uint8_t data[MIDI_TRANSFER_BYTES];
+};
+
+struct MidiLogEvent {
+    MidiLogMessageType type;
+    uint32_t time_ms;
+    uint16_t value;
+    uint8_t cable;
+    uint8_t cin;
+    uint8_t status;
+    uint8_t channel;
+    uint8_t data1;
+    uint8_t data2;
 };
 
 struct UsbMidiHostState {
@@ -33,9 +61,11 @@ struct UsbMidiHostState {
     usb_device_handle_t device = nullptr;
     usb_transfer_t *transfers[MIDI_TRANSFER_COUNT] = {};
     QueueHandle_t packet_queue = nullptr;
+    QueueHandle_t log_queue = nullptr;
     TaskHandle_t daemon_task = nullptr;
     TaskHandle_t client_task = nullptr;
     TaskHandle_t parser_task = nullptr;
+    TaskHandle_t logger_task = nullptr;
     midi_note_callback_t note_callback = nullptr;
     void *note_callback_user_data = nullptr;
     midi_panic_callback_t panic_callback = nullptr;
@@ -47,9 +77,11 @@ struct UsbMidiHostState {
     bool started = false;
     bool device_open = false;
     bool interface_claimed = false;
+    uint32_t dropped_log_count = 0;
 };
 
 UsbMidiHostState state;
+portMUX_TYPE log_count_lock = portMUX_INITIALIZER_UNLOCKED;
 
 void emit_panic(const char *reason)
 {
@@ -59,8 +91,132 @@ void emit_panic(const char *reason)
     }
 }
 
+MidiLogMessageType decode_midi_log_type(uint8_t cin, uint8_t status, uint8_t data2)
+{
+    if (status >= 0xF8) {
+        return MidiLogMessageType::SystemRealtime;
+    }
+    if (status >= 0xF0) {
+        switch (cin) {
+        case 0x4:
+        case 0x5:
+        case 0x6:
+        case 0x7:
+            return MidiLogMessageType::SysEx;
+        case 0x2:
+        case 0x3:
+        case 0xF:
+            return MidiLogMessageType::SystemCommon;
+        default:
+            return MidiLogMessageType::Unknown;
+        }
+    }
+
+    switch (status & 0xF0) {
+    case 0x80:
+        return MidiLogMessageType::NoteOff;
+    case 0x90:
+        return data2 == 0 ? MidiLogMessageType::NoteOff : MidiLogMessageType::NoteOn;
+    case 0xA0:
+        return MidiLogMessageType::PolyPressure;
+    case 0xB0:
+        return MidiLogMessageType::ControlChange;
+    case 0xC0:
+        return MidiLogMessageType::ProgramChange;
+    case 0xD0:
+        return MidiLogMessageType::ChannelPressure;
+    case 0xE0:
+        return MidiLogMessageType::PitchBend;
+    default:
+        return MidiLogMessageType::Unknown;
+    }
+}
+
+void increment_dropped_log_count()
+{
+    portENTER_CRITICAL(&log_count_lock);
+    ++state.dropped_log_count;
+    portEXIT_CRITICAL(&log_count_lock);
+}
+
+uint32_t take_dropped_log_count()
+{
+    portENTER_CRITICAL(&log_count_lock);
+    const uint32_t count = state.dropped_log_count;
+    state.dropped_log_count = 0;
+    portEXIT_CRITICAL(&log_count_lock);
+    return count;
+}
+
+void queue_midi_log_event(const uint8_t *packet)
+{
+    if (state.log_queue == nullptr) {
+        return;
+    }
+
+    const uint8_t cin = packet[0] & 0x0F;
+    const uint8_t status = packet[1];
+    MidiLogEvent event = {
+        .type = decode_midi_log_type(cin, status, packet[3]),
+        .time_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL),
+        .value = static_cast<uint16_t>(packet[2] | (packet[3] << 7)),
+        .cable = static_cast<uint8_t>((packet[0] >> 4) & 0x0F),
+        .cin = cin,
+        .status = status,
+        .channel = static_cast<uint8_t>(status & 0x0F),
+        .data1 = packet[2],
+        .data2 = packet[3],
+    };
+
+    if (xQueueSend(state.log_queue, &event, 0) != pdTRUE) {
+        increment_dropped_log_count();
+    }
+}
+
+void log_midi_event(const MidiLogEvent &event)
+{
+    switch (event.type) {
+    case MidiLogMessageType::NoteOff:
+        ESP_LOGI(TAG, "MIDI Note Off t=%ums cable=%u ch=%u note=%u velocity=%u", event.time_ms, event.cable, event.channel + 1, event.data1, event.data2);
+        break;
+    case MidiLogMessageType::NoteOn:
+        ESP_LOGI(TAG, "MIDI Note On t=%ums cable=%u ch=%u note=%u velocity=%u", event.time_ms, event.cable, event.channel + 1, event.data1, event.data2);
+        break;
+    case MidiLogMessageType::PolyPressure:
+        ESP_LOGI(TAG, "MIDI Poly Pressure t=%ums cable=%u ch=%u note=%u pressure=%u", event.time_ms, event.cable, event.channel + 1, event.data1, event.data2);
+        break;
+    case MidiLogMessageType::ControlChange:
+        ESP_LOGI(TAG, "MIDI Control Change t=%ums cable=%u ch=%u controller=%u value=%u", event.time_ms, event.cable, event.channel + 1, event.data1, event.data2);
+        break;
+    case MidiLogMessageType::ProgramChange:
+        ESP_LOGI(TAG, "MIDI Program Change t=%ums cable=%u ch=%u program=%u", event.time_ms, event.cable, event.channel + 1, event.data1);
+        break;
+    case MidiLogMessageType::ChannelPressure:
+        ESP_LOGI(TAG, "MIDI Channel Pressure t=%ums cable=%u ch=%u pressure=%u", event.time_ms, event.cable, event.channel + 1, event.data1);
+        break;
+    case MidiLogMessageType::PitchBend:
+        ESP_LOGI(TAG, "MIDI Pitch Bend t=%ums cable=%u ch=%u value=%u", event.time_ms, event.cable, event.channel + 1, event.value);
+        break;
+    case MidiLogMessageType::SysEx:
+        ESP_LOGI(TAG, "MIDI SysEx t=%ums cable=%u cin=0x%01x data=%02x %02x %02x", event.time_ms, event.cable, event.cin, event.status, event.data1, event.data2);
+        break;
+    case MidiLogMessageType::SystemCommon:
+        ESP_LOGI(TAG, "MIDI System Common t=%ums cable=%u cin=0x%01x status=0x%02x data=%02x %02x", event.time_ms, event.cable, event.cin, event.status, event.data1, event.data2);
+        break;
+    case MidiLogMessageType::SystemRealtime:
+        ESP_LOGI(TAG, "MIDI System Realtime t=%ums cable=%u status=0x%02x", event.time_ms, event.cable, event.status);
+        break;
+    case MidiLogMessageType::Unknown:
+        ESP_LOGI(TAG, "MIDI Unknown t=%ums cable=%u cin=0x%01x packet=%02x %02x %02x %02x", event.time_ms, event.cable, event.cin,
+                 static_cast<uint8_t>((event.cable << 4) | event.cin), event.status, event.data1, event.data2);
+        break;
+    }
+}
+
 void parse_usb_midi_packet(const uint8_t *packet)
 {
+    queue_midi_log_event(packet);
+
     const uint8_t cin = packet[0] & 0x0F;
     const uint8_t status = packet[1];
     const uint8_t message_type = status & 0xF0;
@@ -87,9 +243,6 @@ void parse_usb_midi_packet(const uint8_t *packet)
     if (message_type == 0x90 && event.velocity > 0) {
         event.type = MidiNoteEventType::NoteOn;
     }
-
-    ESP_LOGD(TAG, "MIDI note %s: channel=%u note=%u velocity=%u",
-             event.type == MidiNoteEventType::NoteOn ? "on" : "off", event.channel + 1, event.note, event.velocity);
 
     if (state.note_callback != nullptr) {
         state.note_callback(event, state.note_callback_user_data);
@@ -130,6 +283,21 @@ void midi_parser_task(void *)
     while (true) {
         if (xQueueReceive(state.packet_queue, &batch, portMAX_DELAY) == pdTRUE) {
             parse_usb_midi_transfer(batch.data, batch.length);
+        }
+    }
+}
+
+void midi_logger_task(void *)
+{
+    MidiLogEvent event = {};
+    while (true) {
+        const BaseType_t received = xQueueReceive(state.log_queue, &event, pdMS_TO_TICKS(1000));
+        const uint32_t dropped = take_dropped_log_count();
+        if (dropped > 0) {
+            ESP_LOGW(TAG, "MIDI log dropped %u messages", static_cast<unsigned>(dropped));
+        }
+        if (received == pdTRUE) {
+            log_midi_event(event);
         }
     }
 }
@@ -324,8 +492,14 @@ esp_err_t usb_midi_host_start()
     state.packet_queue = xQueueCreate(MIDI_PACKET_QUEUE_LEN, sizeof(MidiPacketBatch));
     ESP_RETURN_ON_FALSE(state.packet_queue != nullptr, ESP_ERR_NO_MEM, TAG, "Failed to create USB MIDI packet queue");
 
+    state.log_queue = xQueueCreate(MIDI_LOG_QUEUE_LEN, sizeof(MidiLogEvent));
+    ESP_RETURN_ON_FALSE(state.log_queue != nullptr, ESP_ERR_NO_MEM, TAG, "Failed to create USB MIDI log queue");
+
     BaseType_t result = xTaskCreate(midi_parser_task, "usb_midi_parser", 4096, nullptr, 12, &state.parser_task);
     ESP_RETURN_ON_FALSE(result == pdPASS, ESP_ERR_NO_MEM, TAG, "Failed to create USB MIDI parser task");
+
+    result = xTaskCreate(midi_logger_task, "usb_midi_logger", 4096, nullptr, 8, &state.logger_task);
+    ESP_RETURN_ON_FALSE(result == pdPASS, ESP_ERR_NO_MEM, TAG, "Failed to create USB MIDI logger task");
 
     result = xTaskCreate(usb_daemon_task, "usb_host_daemon", 4096, nullptr, 20, &state.daemon_task);
     ESP_RETURN_ON_FALSE(result == pdPASS, ESP_ERR_NO_MEM, TAG, "Failed to create USB host daemon task");
