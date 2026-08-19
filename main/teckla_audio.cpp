@@ -32,7 +32,6 @@ constexpr gpio_num_t ES8311_I2S_WS = GPIO_NUM_10;
 constexpr gpio_num_t ES8311_I2S_DOUT = GPIO_NUM_9;
 constexpr gpio_num_t ES8311_I2S_DIN = GPIO_NUM_11;
 
-constexpr int PCM5102_I2S_PORT = 1;
 constexpr gpio_num_t PCM5102_I2S_BCLK = GPIO_NUM_46;
 constexpr gpio_num_t PCM5102_I2S_WS = GPIO_NUM_27;
 constexpr gpio_num_t PCM5102_I2S_DOUT = GPIO_NUM_45;
@@ -42,8 +41,12 @@ constexpr uint32_t SAMPLE_RATE = 16000;
 constexpr uint32_t MCLK_MULTIPLE = 384;
 constexpr uint32_t MCLK_FREQ_HZ = SAMPLE_RATE * MCLK_MULTIPLE;
 constexpr int VOLUME_PERCENT = 70;
+constexpr float PCM5102_GAIN = 2.0f;
 constexpr float PI = 3.14159265358979323846f;
 constexpr size_t AUDIO_FRAMES_PER_BUFFER = 128;
+constexpr uint32_t PCM5102_STARTUP_TONE_MS = 500;
+constexpr float PCM5102_STARTUP_TONE_HZ = 523.25f;
+constexpr float PCM5102_STARTUP_TONE_GAIN = 26000.0f;
 constexpr size_t MAX_MIDI_NOTES = 128;
 constexpr size_t TTS_STREAM_BYTES = SAMPLE_RATE * sizeof(int16_t) * 3;
 constexpr float MIDI_RELEASE_STEP = 1.0f / 960.0f;
@@ -152,7 +155,7 @@ esp_err_t init_es8311_i2s()
 
 esp_err_t init_pcm5102_i2s()
 {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(PCM5102_I2S_PORT, I2S_ROLE_MASTER);
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &pcm5102_tx_handle, nullptr), TAG, "create PCM5102A I2S channel failed");
 
@@ -170,7 +173,54 @@ esp_err_t init_pcm5102_i2s()
 
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(pcm5102_tx_handle, &std_cfg), TAG, "init PCM5102A I2S TX failed");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(pcm5102_tx_handle), TAG, "enable PCM5102A I2S TX failed");
+    ESP_LOGI(TAG, "PCM5102A I2S initialized: BCLK=GPIO%d WS=GPIO%d DOUT=GPIO%d", PCM5102_I2S_BCLK, PCM5102_I2S_WS, PCM5102_I2S_DOUT);
     return ESP_OK;
+}
+
+esp_err_t write_all_i2s(i2s_chan_handle_t handle, const void *buffer, size_t byte_count, const char *name)
+{
+    const uint8_t *data = static_cast<const uint8_t *>(buffer);
+    size_t remaining = byte_count;
+    while (remaining > 0) {
+        size_t bytes_written = 0;
+        const esp_err_t err = i2s_channel_write(handle, data, remaining, &bytes_written, portMAX_DELAY);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "%s I2S write failed: %s bytes=%u", name, esp_err_to_name(err), static_cast<unsigned>(bytes_written));
+            return err;
+        }
+        if (bytes_written == 0) {
+            ESP_LOGW(TAG, "%s I2S write made no progress", name);
+            return ESP_ERR_TIMEOUT;
+        }
+        data += bytes_written;
+        remaining -= bytes_written;
+    }
+    return ESP_OK;
+}
+
+void play_pcm5102_startup_tone()
+{
+    int16_t stereo[AUDIO_FRAMES_PER_BUFFER * 2] = {};
+    const uint32_t total_frames = SAMPLE_RATE * PCM5102_STARTUP_TONE_MS / 1000U;
+    const float phase_step = 2.0f * PI * PCM5102_STARTUP_TONE_HZ / static_cast<float>(SAMPLE_RATE);
+    float phase = 0.0f;
+
+    ESP_LOGI(TAG, "Playing PCM5102A startup test tone");
+    for (uint32_t generated = 0; generated < total_frames;) {
+        const size_t frame_count = std::min<size_t>(AUDIO_FRAMES_PER_BUFFER, total_frames - generated);
+        for (size_t i = 0; i < frame_count; ++i) {
+            const int16_t sample = clamp_to_i16(std::sinf(phase) * PCM5102_STARTUP_TONE_GAIN);
+            stereo[i * 2] = sample;
+            stereo[i * 2 + 1] = sample;
+
+            phase += phase_step;
+            if (phase >= 2.0f * PI) {
+                phase -= 2.0f * PI;
+            }
+        }
+        write_all_i2s(pcm5102_tx_handle, stereo, frame_count * 2 * sizeof(int16_t), "PCM5102A startup tone");
+        generated += frame_count;
+    }
 }
 
 esp_err_t init_codec()
@@ -302,6 +352,7 @@ float midi_sample_locked()
 void audio_task(void *)
 {
     int16_t stereo[AUDIO_FRAMES_PER_BUFFER * 2] = {};
+    int16_t pcm5102_stereo[AUDIO_FRAMES_PER_BUFFER * 2] = {};
     int16_t tts_samples[AUDIO_FRAMES_PER_BUFFER] = {};
 
     while (true) {
@@ -323,19 +374,14 @@ void audio_task(void *)
             const int16_t sample = clamp_to_i16(mixed);
             stereo[i * 2] = sample;
             stereo[i * 2 + 1] = sample;
+
+            const int16_t pcm5102_sample = clamp_to_i16(mixed * PCM5102_GAIN);
+            pcm5102_stereo[i * 2] = pcm5102_sample;
+            pcm5102_stereo[i * 2 + 1] = pcm5102_sample;
         }
 
-        size_t bytes_written = 0;
-        const esp_err_t err = i2s_channel_write(es8311_tx_handle, stereo, sizeof(stereo), &bytes_written, portMAX_DELAY);
-        if (err != ESP_OK || bytes_written != sizeof(stereo)) {
-            ESP_LOGW(TAG, "ES8311 I2S write failed: %s bytes=%u", esp_err_to_name(err), static_cast<unsigned>(bytes_written));
-        }
-
-        bytes_written = 0;
-        const esp_err_t pcm_err = i2s_channel_write(pcm5102_tx_handle, stereo, sizeof(stereo), &bytes_written, portMAX_DELAY);
-        if (pcm_err != ESP_OK || bytes_written != sizeof(stereo)) {
-            ESP_LOGW(TAG, "PCM5102A I2S write failed: %s bytes=%u", esp_err_to_name(pcm_err), static_cast<unsigned>(bytes_written));
-        }
+        write_all_i2s(es8311_tx_handle, stereo, sizeof(stereo), "ES8311");
+        write_all_i2s(pcm5102_tx_handle, pcm5102_stereo, sizeof(pcm5102_stereo), "PCM5102A");
     }
 }
 
@@ -352,6 +398,7 @@ esp_err_t teckla_audio_init()
     ESP_RETURN_ON_ERROR(init_es8311_i2s(), TAG, "ES8311 I2S init failed");
     ESP_RETURN_ON_ERROR(init_pcm5102_i2s(), TAG, "PCM5102A I2S init failed");
     ESP_RETURN_ON_ERROR(init_codec(), TAG, "codec init failed");
+    play_pcm5102_startup_tone();
 
     tts_stream = xStreamBufferCreate(TTS_STREAM_BYTES, sizeof(int16_t));
     ESP_RETURN_ON_FALSE(tts_stream != nullptr, ESP_ERR_NO_MEM, TAG, "create TTS stream failed");

@@ -47,11 +47,24 @@ USB MIDI receive is designed to avoid missed note-off bursts during chord playin
 ## Audio Notes
 
 - Codec output volume is currently set to `70` in `main/teckla_audio.cpp`.
+- External PCM5102A output currently applies `PCM5102_GAIN = 2.0f` after mixing; the onboard ES8311 output keeps the original level.
 - MIDI tones use a fundamental plus second harmonic. `MIDI_SECOND_HARMONIC_GAIN` is currently `0.35f`.
 - `audio_task()` is the only audio writer. TTS, MIDI, and feedback audio must go through the mixer.
 - The onboard ES8311 uses I2S port `0`: `MCLK=GPIO13`, `BCLK=GPIO12`, `WS=GPIO10`, `DOUT=GPIO9`, `DIN=GPIO11`.
-- The external PCM5102A output uses I2S port `1`: `BCLK=GPIO46`, `WS/LRCK=GPIO27`, `DOUT=GPIO45`. Connect PCM5102A `DIN` to ESP32 `DOUT`.
-- The PCM5102A output receives the same mixed stereo audio as the onboard speaker path.
+- The external PCM5102A output uses auto I2S channel allocation: `BCLK=GPIO46`, `WS/LRCK=GPIO27`, `DOUT=GPIO45`. Connect PCM5102A `DIN` to ESP32 `DOUT`.
+- The PCM5102A output receives the same mixed stereo audio as the onboard speaker path, but through a separate louder output buffer.
+- On startup, firmware plays a PCM5102A-only `523.25 Hz` test tone for `500 ms` before starting the normal audio task.
+
+## Current PCM5102A Status
+
+- The onboard ES8311 speaker path builds, flashes, and remains the known working audio path.
+- The PCM5102A support has been added in software but is not yet working on the ESP32-P4 board in this project.
+- The latest flashed diagnostic firmware still produced no audible PCM5102A output.
+- A separate test application at `C:\Users\Joak\Desktop\FUN\xstage\SoundsbyActuators\s3zero_test` works with the same PCM5102A hardware on a different ESP32-S3-Zero board.
+- The working test app uses the same ESP-IDF I2S standard driver style, no MCLK, Philips format, 16-bit stereo, and a continuous high-amplitude test tone at `44100 Hz`.
+- This project currently uses `16000 Hz` to match the existing mixer/TTS path. If the PCM5102A startup tone remains silent, a focused next test is to try a PCM-only `44100 Hz` diagnostic path or temporarily make the whole mixer run at `44100 Hz` if TTS impact is acceptable.
+- Another next diagnostic is to verify I2S clocks on `GPIO46`, `GPIO27`, and `GPIO45` with a logic analyzer or oscilloscope during the startup tone.
+- Hardware items to recheck: common ground, PCM5102A `XMT`/`XSMT` held high if exposed, correct connection to DAC `DIN`, and whether the module output is line-level rather than speaker-level.
 
 ## Build
 
@@ -70,4 +83,4 @@ The board has been tested on `COM10`:
 idf.py -p COM10 flash
 ```
 
-To monitor with debug-level MIDI note logs, enable a debug log level in ESP-IDF configuration or adjust the MIDI note log level in `main/usb_midi_host.cpp`.
+MIDI messages are logged at info level by the dedicated USB MIDI logger task.
